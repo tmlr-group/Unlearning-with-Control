@@ -84,5 +84,3 @@ If you find our metrics beneficial, please cite our work:
   year={2024}
 }
 ```
-## Quick Links
-This project is heavily rely on the [**TOFU**](https://github.com/locuslab/tofu)
