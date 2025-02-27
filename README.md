@@ -29,7 +29,7 @@ The code currently supports `Phi-1.5`, and `Llama2-7b chat` models. But newer mo
 ```
 master_port=18765
 split=full
-model=phi
+model=phi #you can choose phi, llama2-7b
 lr=2e-5
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=$master_port finetune.py --config-name=finetune.yaml split=${split} batch_size=4 gradient_accumulation_steps=4 model_family=${model} lr=${lr}
 ```
@@ -37,34 +37,25 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=$master_port 
 ## Forget models
 Make sure that the path of the model to be unlearned is correctly provided in the `config/model_config.yaml` file. To unlearn a model on a forget set, use the following command:
 ```
+cuda_id=0
+master_port=18765
 save_steps=25  # save the checkpoint every 25 steps
-forget_loss=grad_diff    # you can choose grad_diff, grad_ascent, ocr_ce, only_fgt 
-delta=6 #this is the upper bound of unlearning control
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=$master_port forget.py --config-name=forget_2.yaml split=${split} batch_size=4 gradient_accumulation_steps=4 model_family=${model} lr=${lr} forget_loss=${forget_loss} save_steps=${save_steps} delta_ocr=${delta}
+model=phi #you can choose phi, llama2-7b
+forget_loss=ga    # you can choose ga, ga_kl, gd, KL 
+CUDA_VISIBLE_DEVICES=$cuda_id torchrun --nproc_per_node=1 --master_port=$master_port forget.py --config-name=forget.yaml split=${split} batch_size=4 gradient_accumulation_steps=4 model_family=${model} lr=${lr} forget_loss=${forget_loss} save_steps=$save_steps
 ```
 
 ## Evaluate models
-Once you have the model trained, you can generate the PS-series merics used for evaluation with the following command:
-
-For llama:
+Once you have the model trained, you can generate the PS-series metrics used for evaluation with the following command:
 
 ```
+cuda_id=0
+master_port=18765
+model=phi #you can choose phi, llama2-7b
 ckpt=baseline/llama2-7b/grad_ascent_1e-05_forget05_8_0.0_250/checkpoint-125  # where the checkpoint is stored
-update_rate=0.0 # the ratio of mixing the unlearned model and the original model, 0.0 means totally unlearned model
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 llama_exact.py model_family=llama2-7b split=${split} model_path=${ckpt} update_=0.0
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 llama_similar.py model_family=llama2-7b split=${split} model_path=${ckpt} update_=0.0
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 llama_perturb.py model_family=llama2-7b split=${split} model_path=${ckpt} update_=0.0
+CUDA_VISIBLE_DEVICES=$cuda_id torchrun --nproc_per_node=1 --master_port=$master_port evaluation_everything.py split=${split} model_family=${model} model_path=${ckpt}
 ```
 
-For phi:
-
-```
-ckpt=baseline/phi/grad_ascent_2e-05_forget05_8_0.0_250/checkpoint-125  # where the checkpoint is stored
-update_rate=0.0 # the ratio of mixing the unlearned model and the original model, 0.0 means totally unlearned model
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 phi_exact.py model_family=phi split=${split} model_path=${ckpt} update_=0.0
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 phi_similar.py model_family=phi split=${split} model_path=${ckpt} update_=0.0
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=18141 lphi_perturb.py model_family=phi split=${split} model_path=${ckpt} update_=0.0
-```
 ### Available forget sets are:
 
 - `forget01`: Forgetting 1% of the original dataset, all entries correspond to a single author.
@@ -77,10 +68,10 @@ Retain sets corresponding to each forget set are also available, which can be us
 
 If you find our metrics beneficial, please cite our work:
 ```
-@article{wang2024unlearning,
-  title={Unlearning with Control: Assessing Real-world Utility for Large Language Model Unlearning},
-  author={Wang, Qizhou and Han, Bo and Yang, Puning and Zhu, Jianing and Liu, Tongliang and Sugiyama, Masashi},
-  journal={arXiv preprint arXiv:2406.09179},
-  year={2024}
+@inproceedings{wang2025towards,
+title={Towards Effective Evaluations and Comparison for LLM Unlearning Methods}, 
+author={Qizhou Wang and Bo Han and Puning Yang and Jianing Zhu and Tongliang Liu and Masashi Sugiyama},
+booktitle = {International Conference on Learning Representations},
+year = {2025}
 }
 ```

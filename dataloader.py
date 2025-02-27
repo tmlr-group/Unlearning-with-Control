@@ -4,24 +4,25 @@ from transformers import Trainer
 import torch.nn.functional as F
 import copy, os
 import deepspeed
-from evaluate_util import get_dataloader, get_all_evals
+#from evaluate_util import get_dataloader, get_all_evals
 import copy
 import json 
 from pathlib import Path
-from data_module import get_batch_loss,get_batch_loss_ocr
+from data_module import get_batch_loss
 from utils import merge_dicts, interleave_eval_result_dict, get_forget_quality, get_model_utility
 import numpy as np
 from scipy.stats import ks_2samp, hmean
 import csv 
 from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
 import pdb
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 def printll(name, inp):
     #print list with 4 decimal for each item
     print(name, [round(x, 4) for x in inp])
 
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False):# the first ti
         input_ids, labels, attention_mask = inputs
         # forward pass
         outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
@@ -40,8 +41,6 @@ class CustomTrainer(Trainer):
             logits = outputs.logits
             loss = outputs.loss
         return (loss, logits, labels)
-    
-
 
 class CustomTrainerForgetting(Trainer):
     def __init__(self, *args, **kwargs):
@@ -49,14 +48,16 @@ class CustomTrainerForgetting(Trainer):
         self.oracle_model = kwargs.pop('oracle_model')
         self.eval_cfg = kwargs.pop('eval_cfg')
         self.org_ckpt=kwargs.pop('ckpt_org')
-        self.ball=kwargs.pop('ball')
+        self.hyper_param=kwargs.pop('hyper_param')
         self.max_steps=kwargs.pop('max_steps')
-        self.delta_ocr=kwargs.pop('delta_ocr')
-        self.ratio=kwargs.pop('ratio')
+        self.strategy=kwargs.pop('strategy')
         self.count_step=0
+        self.rmu_noise=torch.rand((1,1,4096)).cuda()
         super(CustomTrainerForgetting, self).__init__(*args, **kwargs)
-        if self.loss_type in ["KL",'ocr_KL005','ocr_KL001']:
+        try:
             self.oracle_model = self.e_prepare_deepspeed(self.oracle_model)
+        except: 
+            self.oracle_model = self.oracle_model.cuda()
 
     def e_prepare_deepspeed(self, model):
         # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
@@ -94,9 +95,119 @@ class CustomTrainerForgetting(Trainer):
         
         return model
     
+    
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        if self.loss_type == "grad_ascent":
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        '''for idx, (n, m) in enumerate(model.named_parameters()):
+            if len(n.split('.')) > 4 and int(n.split('.')[3]) == 22: break
+            m.reqiureds_grad = False '''
+        
+        def get_batch_loss(output, labels):
+            shifted_labels = labels[..., 1:].contiguous()
+            output = output[..., :-1, :].contiguous()
+
+            loss_function = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+            # get the sum loss for each sequence in a batch
+            loss = loss_function(output.transpose(-1,-2), shifted_labels).sum(dim=-1)
+
+            return loss
+        if self.loss_type == 'npo_kl': 
+            if self.hyper_param != 'None' or self.hyper_param != 20:
+                self.beta = self.hyper_param
+            else: self.beta=.5
+
+            if self.hyper_param == 'None': 
+                self.hyper_param =20
+
+
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
+            forget_loss_current = get_batch_loss(outputs.logits, labels) 
+            with torch.no_grad():
+                forget_outputs_oracle = self.oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
+                forget_logits_oracle = forget_outputs_oracle.logits
+                forget_loss_oracle = get_batch_loss(forget_logits_oracle, labels)
+            neg_log_ratios = forget_loss_current - forget_loss_oracle
+            loss = -F.logsigmoid(self.beta * neg_log_ratios).mean() * 2 / self.beta 
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+            loss += retain_loss * self.hyper_param 
+        if self.loss_type == 'npo': 
+            if self.hyper_param != 'None':
+                self.beta = self.hyper_param
+            else: self.beta=.5
+      
+            forget_inputs, _ = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
+            forget_loss_current = get_batch_loss(outputs.logits, labels) 
+            with torch.no_grad():
+                forget_outputs_oracle = self.oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
+                forget_logits_oracle = forget_outputs_oracle.logits
+                forget_loss_oracle = get_batch_loss(forget_logits_oracle, labels)
+            neg_log_ratios = forget_loss_current - forget_loss_oracle
+            loss = -F.logsigmoid(self.beta * neg_log_ratios).mean() * 2 / self.beta 
+        
+
+        if 'rmu_' in self.loss_type and '_kl' in self.loss_type: # 32 21 10
+            if self.hyper_param != 'None':
+                c = self.hyper_param
+            else: 
+                c=2
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            emb_tar = self.rmu_noise * c
+            emb_idx = int(self.loss_type.split('_')[1]) # 32 21 10
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask, output_hidden_states=True)
+            emb_dif = ((outputs.hidden_states[emb_idx][..., :-1, :] - emb_tar[0,0,:outputs.hidden_states[emb_idx][..., :-1, :].size(-1)]) ** 2).mean(-1) 
+            # emb_dif = ((outputs.hidden_states[emb_idx][..., :-1, :] - emb_tar).abs()).mean(-1) 
+            forget_loss = emb_dif[labels[..., 1:] != -100].mean()
+            loss = forget_loss
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+
+            #minimum KL divergence
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+            loss += retain_loss
+
+        
+            
+        elif 'rmu_' in self.loss_type and '_kl' not in self.loss_type: # 32 21 10
+            if self.hyper_param != 'None':
+                c = self.hyper_param
+            else: 
+                c=2
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            emb_tar = self.rmu_noise * c
+            emb_idx = int(self.loss_type.split('_')[-1]) # 32 21 10
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask, output_hidden_states=True)
+            # emb_dif = ((outputs.hidden_states[emb_idx][..., :-1, :] - emb_tar) ** 2).mean(-1) 
+            # emb_dif = ((outputs.hidden_states[emb_idx][..., :-1, :] - emb_tar).abs()).mean(-1) 
+            emb_dif = ((outputs.hidden_states[emb_idx][..., :-1, :] - emb_tar[0,0,:outputs.hidden_states[emb_idx][..., :-1, :].size(-1)]) ** 2).mean(-1) 
+            forget_loss = emb_dif[labels[..., 1:] != -100].mean()
+            loss = forget_loss
+            
+          
+        if self.loss_type == "ga_kl":
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
             outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
@@ -104,20 +215,71 @@ class CustomTrainerForgetting(Trainer):
             forget_loss = forget_loss * -1
             loss = forget_loss
 
-        elif self.loss_type == 'only_fgt':
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+
+            #minimum KL divergence
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+            loss += retain_loss
+        
+        if self.loss_type == "ga":
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
             outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-            ocr_part, ocr_count = get_batch_loss_ocr(outputs.logits,labels,self.delta_ocr)
-            if ocr_count==0:
-                loss=ocr_part
-            else:
-                loss=ocr_part/ocr_count
-            return loss
-    
-        elif self.loss_type == "grad_diff":
+            forget_loss = outputs.loss
+            forget_loss = forget_loss * -1
+            loss = forget_loss
+        
+        elif self.loss_type == "idk_kl":
+            idk_inputs, retain_inputs = inputs
+            idk_input_ids, idk_labels, idk_attention_mask = idk_inputs
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            input_ids = torch.cat((idk_input_ids, retain_input_ids), dim=0)
+            labels = torch.cat((idk_labels, retain_labels), dim=0)
+            attention_mask = torch.cat((idk_attention_mask, retain_attention_mask), dim=0)
+            
+            outputs_idk = model(idk_input_ids,labels=idk_labels, attention_mask=idk_attention_mask)
+            loss = outputs_idk.loss
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+
+            #minimum KL divergence
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+            loss += retain_loss
+        
+        elif self.loss_type == "idk":
+            idk_inputs, retain_inputs = inputs
+            idk_input_ids, idk_labels, idk_attention_mask = idk_inputs
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            input_ids = torch.cat((idk_input_ids, retain_input_ids), dim=0)
+            labels = torch.cat((idk_labels, retain_labels), dim=0)
+            attention_mask = torch.cat((idk_attention_mask, retain_attention_mask), dim=0)
+            
+            outputs_idk = model(idk_input_ids,labels=idk_labels, attention_mask=idk_attention_mask)
+            loss = outputs_idk.loss
+
+        elif self.loss_type == "gd":
+            gd_coef = 1
+            if self.hyper_param != 'None':
+                gd_coef = self.hyper_param
             forget_inputs, retain_inputs = inputs
-            #print(len(forget_inputs),len(retain_inputs))
             input_ids, labels, attention_mask = forget_inputs
             outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
             forget_loss = outputs.loss
@@ -126,30 +288,12 @@ class CustomTrainerForgetting(Trainer):
             retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
             retain_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
             retain_loss = retain_outputs.loss
-            #print('Forget Loss: ', forget_loss, 'Retain Loss: ', retain_loss)
-            loss = forget_loss + retain_loss
+            loss = forget_loss + gd_coef * retain_loss
 
-        elif self.loss_type == 'ocr_ce':
-            forget_inputs, retain_inputs = inputs
-            #retain_keep
-            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
-            retain_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
-            retain_loss = retain_outputs.loss
-            #forget_modify
-            input_ids, labels, attention_mask = forget_inputs
-            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-            ocr_part, ocr_count = get_batch_loss_ocr(outputs.logits,labels,self.delta_ocr)
-            if ocr_count==0:
-                loss=0.*(retain_loss+1.*ocr_part)
-            else:
-                print(retain_loss,ocr_part/ocr_count)
-                loss=(1-self.ratio)*retain_loss+self.ratio*ocr_part/ocr_count
-                #loss=retain_loss+ocr_part
-            #current_probs = F.log_softmax(outputs.logits, dim=-1)
-            #current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
-            return loss
-         
         elif self.loss_type == "KL":
+            KL_coef = 1
+            if self.hyper_param != 'None':
+                KL_coef = self.hyper_param
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
             outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
@@ -168,56 +312,171 @@ class CustomTrainerForgetting(Trainer):
 
             #minimum KL divergence
             retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
-            loss = forget_loss + retain_loss
+            loss = forget_loss + KL_coef *retain_loss
+            
+        if self.loss_type == "ga_LS":
+            q = 0.8
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
 
-        elif self.loss_type == "idk":
-            idk_inputs, retain_inputs = inputs
-            idk_input_ids, idk_labels, idk_attention_mask = idk_inputs
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)           
+            labels = labels.to(outputs.logits.device)
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = CrossEntropyLoss(ignore_index= -100, reduction = 'none')(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            
+            # Reshape the loss to match the dimensions of each element in the batch
+            loss = loss.view(shift_logits.size(0), -1)
+
+            # Generate a mask for valid tokens
+            valid_tokens_mask = shift_labels != -100
+
+            # Apply the mask to the loss, setting invalid positions to a very large value to ensure they are not selected
+            adjusted_loss = torch.where(valid_tokens_mask, loss, torch.tensor(float('inf')).to(loss.device))
+
+            # Sort the losses and select the indices of the smallest losses, ensuring no selection of positions where original labels are -100
+            _, indices = torch.sort(adjusted_loss, dim=1, descending=False)
+            # Calculate the number of tokens to select for each batch element
+            num_tokens_to_select = (q * valid_tokens_mask.sum(dim=1).float()).int()
+
+            # Create a list of selected indices for each batch element
+            selected_indices_list = [indices[i, :num_tokens_to_select[i]] for i in range(indices.size(0))]
+
+            # Create an update mask where only the selected indices will be updated
+            update_mask = torch.zeros_like(adjusted_loss, dtype=torch.bool)
+            for i, sel_idx in enumerate(selected_indices_list):
+                update_mask[i, sel_idx] = True
+
+            # Compute the final loss using only the selected indices
+            selected_loss = (loss * update_mask).sum() / update_mask.sum()
+
+            # Negate the loss for gradient ascent
+            loss = -selected_loss
+
+            print("Step loss:", loss)
+                
+        if self.loss_type == "ga_temp":
+
+            temperature = 2.0
+            temperature = self.strategy
+
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)           
+            labels = labels.to(outputs.logits.device)
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Apply temperature scaling
+            scaled_logits = shift_logits / temperature
+            loss = CrossEntropyLoss(ignore_index= -100, reduction = 'none')(scaled_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = -loss[shift_labels.view(-1)!=-100].mean()
+            print("step loss:",loss)
+
+
+        if self.loss_type == "KL_temp":
+            KL_coef = 1
+            if self.hyper_param != 'None':
+                KL_coef = self.hyper_param
+
+            temperature = self.strategy
+
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)           
+            labels = labels.to(outputs.logits.device)
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Apply temperature scaling
+            scaled_logits = shift_logits / temperature
+            loss = CrossEntropyLoss(ignore_index= -100, reduction = 'none')(scaled_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = -loss[shift_labels.view(-1)!=-100].mean()
+
+            # kl loss
             retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
-            
-            #concatenate the inputs. single forward pass is much more efficient
-            input_ids = torch.cat((idk_input_ids, retain_input_ids), dim=0)
-            labels = torch.cat((idk_labels, retain_labels), dim=0)
-            attention_mask = torch.cat((idk_attention_mask, retain_attention_mask), dim=0)
-            
-            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
-            outputs_in = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
-            print('Retain:', outputs_in.loss)
-            outputs_idk = model(idk_input_ids,labels=idk_labels, attention_mask=idk_attention_mask)
-            print('IDK:', outputs_idk.loss)
-            loss = outputs.loss
-            
-        
-        elif self.loss_type == "dpo":
-            idk_inputs, forget_inputs, retain_inputs = inputs
-            idk_input_ids, idk_labels, idk_attention_mask = idk_inputs
-            forget_input_ids, forget_labels, forget_attention_mask = forget_inputs
-            idk_outputs = model(idk_input_ids,labels=idk_labels, attention_mask=idk_attention_mask)
-            forget_outputs = model(forget_input_ids,labels=forget_labels, attention_mask=forget_attention_mask)
-
             with torch.no_grad():
-                idk_outputs_oracle = self.oracle_model(idk_input_ids,labels=idk_labels, attention_mask=idk_attention_mask)
-                forget_outputs_oracle = self.oracle_model(forget_input_ids,labels=forget_labels, attention_mask=forget_attention_mask)
-                idk_logits_oracle = idk_outputs_oracle.logits
-                forget_logits_oracle = forget_outputs_oracle.logits
-
-            idk_loss_oracle = -1 * get_batch_loss(idk_logits_oracle, idk_labels)
-            forget_loss_oracle = -1 * get_batch_loss(forget_logits_oracle, labels)
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
             
-            idk_loss_current = -1 * get_batch_loss(idk_outputs.logits, idk_labels)
-            forget_loss_current = -1 * get_batch_loss(forget_outputs.logits, labels)
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
 
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
 
-            pi_logratios = idk_loss_current - forget_loss_current
-            ref_logratios = idk_loss_oracle - forget_loss_oracle
+            #minimum KL divergence
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
 
-            beta = 0.1
-            loss = -F.logsigmoid(beta * (pi_logratios - ref_logratios)).mean()
-            print(loss.item())
-            loss = -pi_logratios.mean()
-            loss = -idk_loss_current.mean()
+            loss += retain_loss * KL_coef
 
-            outputs = forget_outputs
+            print("step loss:",loss)
+        
+        if self.loss_type == "KL_LS":
+            q = self.strategy
+            KL_coef = 1
+            if self.hyper_param != 'None':
+                KL_coef = self.hyper_param
+
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+
+            outputs = model(input_ids,labels=labels, attention_mask=attention_mask)           
+            labels = labels.to(outputs.logits.device)
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = CrossEntropyLoss(ignore_index= -100, reduction = 'none')(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            
+            # Reshape the loss to match the dimensions of each element in the batch
+            loss = loss.view(shift_logits.size(0), -1)
+
+            # Generate a mask for valid tokens
+            valid_tokens_mask = shift_labels != -100
+
+            # Apply the mask to the loss, setting invalid positions to a very large value to ensure they are not selected
+            adjusted_loss = torch.where(valid_tokens_mask, loss, torch.tensor(float('inf')).to(loss.device))
+
+            # Sort the losses and select the indices of the smallest losses, ensuring no selection of positions where original labels are -100
+            _, indices = torch.sort(adjusted_loss, dim=1, descending=False)
+            # Calculate the number of tokens to select for each batch element
+            num_tokens_to_select = (q * valid_tokens_mask.sum(dim=1).float()).int()
+
+            # Create a list of selected indices for each batch element
+            selected_indices_list = [indices[i, :num_tokens_to_select[i]] for i in range(indices.size(0))]
+
+            # Create an update mask where only the selected indices will be updated
+            update_mask = torch.zeros_like(adjusted_loss, dtype=torch.bool)
+            for i, sel_idx in enumerate(selected_indices_list):
+                update_mask[i, sel_idx] = True
+
+            # Compute the final loss using only the selected indices
+            selected_loss = (loss * update_mask).sum() / update_mask.sum()
+
+            # Negate the loss for gradient ascent
+            loss = -selected_loss
+
+            # kl loss
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            
+            retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+
+            current_outputs = model(retain_input_ids,labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.log_softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+
+            #minimum KL divergence
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
+
+            loss += retain_loss * KL_coef
+
+            print("step loss:",loss)
         
         return (loss, outputs) if return_outputs else loss
         
@@ -361,8 +620,6 @@ def custom_data_collator_forget(samples):
         rets.append((torch.stack(input_ids), torch.stack(labels), torch.stack(attention_mask)))
     return rets
 
-
-
 def compute_metrics(pred):
     logits, labels = torch.from_numpy(pred.predictions), torch.from_numpy(pred.label_ids)
     preds = torch.from_numpy(pred.predictions.argmax(-1))
@@ -381,3 +638,24 @@ def get_loss(output, labels):
     return loss
 
 
+def custom_data_collator_forget_wmdp(samples):
+    rets = []
+    if len(samples[0]) == 3:
+        idk_samples, forget_samples, retain_samples = [sample[0] for sample in samples], [sample[1] for sample in samples], [sample[2] for sample in samples]
+        data_types = ["idk", "forget", "retain"]
+    elif len(samples[0]) == 2:
+        forget_samples, retain_samples = [sample[0] for sample in samples], [sample[1] for sample in samples]
+        data_types = ["forget", "retain"]
+    for data_type in data_types:
+        if data_type == "forget":
+            data = forget_samples 
+        elif data_type == "retain":
+            data = retain_samples 
+        elif data_type == "idk":
+            data = idk_samples
+        
+        input_ids = [s["input_ids"] for s in data]
+        labels = [s["labels"] for s in data]
+        attention_mask = [s["attention_mask"] for s in data]
+        rets.append((torch.stack(input_ids), torch.stack(labels), torch.stack(attention_mask)))
+    return rets

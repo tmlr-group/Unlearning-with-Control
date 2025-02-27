@@ -13,9 +13,9 @@ split_list:
   - ${split}
 
 update_: 0.1
+ps_p: 0.9
 question_key: [question, question, question, question]
 answer_key: [answer, answer, answer, answer]
-
 base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
 perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
 
@@ -37,3 +37,6 @@ reinitialize_weights: false
 
 retain_result: null
 percent: 0.5
+
+ps_type: exact
+

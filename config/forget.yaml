@@ -1,27 +1,24 @@
-model_family: llama2-7b #phi llama2-7b
-w_decay: 0.01
+model_family: phi #phi llama2-7b
+w_decay: 0.0
 LoRA:
   r: 0
   alpha: 32
   dropout: 0.05
 
 lr: 2e-5
-split: forget10 #forget10 forget05
+split: forget01
 data_path: locuslab/TOFU
-batch_size: 2 #4
+batch_size: 4 #4
 gradient_accumulation_steps: 4
-num_epochs: 8 #5
+num_epochs: 5 #5
 forget_loss: grad_ascent
-#forget_loss: grad_diff
-delta_ocr: 2
-ball: 1e-3
-ratio: 0.1
+hyper_param: None
 
-model_path: data/weight/ft_epoch5_lr${lr}_${model_family}_full_wd${w_decay}/checkpoint-625
-save_dir: iclr/${model_family}/${forget_loss}_${lr}_${split}_${num_epochs}_${w_decay}_${delta_ocr}_${ratio}
-save_steps: 250
+model_path: /data/weight/ft_epoch5_lr1e-05_llama2-7b_full_wd0.0/checkpoint-625
+save_dir: iclr/${model_family}/${forget_loss}_${lr}_${split}_${num_epochs}_${w_decay}_${hyper_param}
+save_steps: 25
 overwrite_dir: True
-weight_decay: 0.01
+weight_decay: 0.0
 save_model: true
 eval_while_train: false
 eval_only: false
@@ -59,3 +56,5 @@ eval:
 
   batch_size: 30
   retain_result: null
+
+strategy: false

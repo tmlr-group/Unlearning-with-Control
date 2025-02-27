@@ -1,4 +1,4 @@
-from data_module import TextForgetDatasetQA2, TextForgetDatasetDPOQA2
+from data_module import TextForgetDatasetQA2
 from dataloader import CustomTrainerForgetting, custom_data_collator_forget
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, set_seed
@@ -64,6 +64,11 @@ def main(cfg):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
+    
+    if cfg.strategy:
+        cfg.save_dir = cfg.save_dir+"s"+str(cfg.strategy)
+    
+    
     print("######################")
     print("Saving to: ", cfg.save_dir)
     print("######################")
@@ -75,10 +80,7 @@ def main(cfg):
             exit()
 
     max_length = 500
-    if cfg.forget_loss == "dpo":
-        torch_format_dataset = TextForgetDatasetDPOQA2(cfg.data_path, tokenizer=tokenizer, model_family = cfg.model_family, max_length=max_length, split=cfg.split)
-    else:
-        torch_format_dataset = TextForgetDatasetQA2(cfg.data_path, tokenizer=tokenizer, model_family = cfg.model_family, max_length=max_length, split=cfg.split, loss_type=cfg.forget_loss)
+    torch_format_dataset = TextForgetDatasetQA2(cfg.data_path, tokenizer=tokenizer, model_family = cfg.model_family, max_length=max_length, split=cfg.split, loss_type=cfg.forget_loss)
     
     batch_size = cfg.batch_size
     gradient_accumulation_steps = cfg.gradient_accumulation_steps
@@ -98,26 +100,28 @@ def main(cfg):
             learning_rate=cfg.lr,
             bf16=True,
             bf16_full_eval=True,
-            logging_steps=max(1,max_steps//20),
+            logging_steps=1,
             logging_dir=f'{cfg.save_dir}/logs',
             output_dir=cfg.save_dir,
             optim="paged_adamw_32bit",
-            save_strategy="steps" if cfg.save_model and (not cfg.eval_only) else "no",
+            #save_strategy='epoch',
+            save_strategy="steps",
             save_steps=cfg.save_steps,
             save_only_model=True,
             ddp_find_unused_parameters= False,
             deepspeed='config/ds_config.json',
             weight_decay = cfg.weight_decay,
-            eval_steps=100,
+            eval_steps=1,
             evaluation_strategy = "steps" if cfg.eval_while_train else "no",
-            seed=cfg.seed
-
+            seed=cfg.seed,
+            max_grad_norm = 1,
         )
     
     #first get the base model architectur2e
     #if there is a pytorch*.bin file in the model path, then load that. use regex there can be anythign in between pytorch and .bin
     import re
     path_found = False
+    print(cfg.model_path)
     for file in os.listdir(cfg.model_path):
         if re.search("pytorch.*\.bin", file):
             path_found = True
@@ -134,9 +138,9 @@ def main(cfg):
 
         print("Loading from checkpoint")
         model = AutoModelForCausalLM.from_pretrained(cfg.model_path, config=config, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
-        if cfg.forget_loss in ["KL"]:
-            oracle_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, config=config, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
-
+        # if 'KL' in cfg.forget_loss or 'npo' in cfg.forget_loss:
+        oracle_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, config=config, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
+        
     else:
         print("Loading after merge and unload")
         model = AutoModelForCausalLM.from_pretrained(model_id, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, device_map=device_map)
@@ -181,10 +185,9 @@ def main(cfg):
         ckpt_org=ckpt_org,
         forget_loss = cfg.forget_loss,
         eval_cfg = cfg.eval,
-        ball=cfg.ball,
+        hyper_param=cfg.hyper_param,
         max_steps=max_steps*gradient_accumulation_steps,
-        delta_ocr=cfg.delta_ocr,
-        ratio=cfg.ratio
+        strategy=cfg.strategy
     )
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
     # trainer.train()
