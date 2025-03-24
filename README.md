@@ -1,6 +1,6 @@
-# Unlearning with Control: Assessing Real-world Utility for LLM Unlearning 
+# Towards Effective Evaluations and Comparison for LLM Unlearning Methods
 
-This is the code for the paper [**Unlearning with Control: Assessing Real-world Utility for LLM Unlearning**](https://arxiv.org/abs/2406.09179)
+This is the code for the paper [**Towards Effective Evaluations and Comparison for LLM Unlearning Methods**](https://arxiv.org/abs/2406.09179)
 
 ## Installation
 
